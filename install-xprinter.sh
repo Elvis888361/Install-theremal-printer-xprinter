@@ -6,10 +6,17 @@
 #
 # Usage:
 #   chmod +x install-xprinter.sh
-#   ./install-xprinter.sh                 # auto-detect and install
-#   ./install-xprinter.sh --queue XP-80   # custom queue name
-#   ./install-xprinter.sh --width 58      # for 58mm printers (default 80)
-#   ./install-xprinter.sh --uninstall     # remove queue and PPD
+#   ./install-xprinter.sh                          # auto-detect USB, install
+#   ./install-xprinter.sh --queue XP-80            # custom queue name
+#   ./install-xprinter.sh --width 58               # 58mm printers (default 80)
+#   ./install-xprinter.sh --bluetooth AA:BB:..:FF  # also set up Bluetooth queue
+#   ./install-xprinter.sh --bt-channel 1           # SPP channel (default 1)
+#   ./install-xprinter.sh --uninstall              # remove queue and PPD
+#
+# The Bluetooth printer must already be paired (use bluetoothctl). The script
+# binds /dev/rfcomm0 to it, fixes CUPS backend permissions, patches the cupsd
+# AppArmor profile to allow /dev/rfcomm*, and adds a parallel CUPS queue named
+# <QUEUE>-BT.
 #
 # Tested on Ubuntu 22.04 / 24.04, Debian 12.
 # Author: built for ERPNext / Frappe Print Format use cases.
@@ -19,12 +26,16 @@ set -euo pipefail
 QUEUE="POS-80"
 WIDTH_MM="80"
 UNINSTALL=0
+BT_MAC=""
+BT_CHANNEL="1"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --queue)     QUEUE="$2"; shift 2 ;;
-    --width)     WIDTH_MM="$2"; shift 2 ;;
-    --uninstall) UNINSTALL=1; shift ;;
+    --queue)      QUEUE="$2"; shift 2 ;;
+    --width)      WIDTH_MM="$2"; shift 2 ;;
+    --bluetooth)  BT_MAC="$2"; shift 2 ;;
+    --bt-channel) BT_CHANNEL="$2"; shift 2 ;;
+    --uninstall)  UNINSTALL=1; shift ;;
     -h|--help)
       sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
@@ -358,6 +369,70 @@ else
   warn "Test job submission failed. Check 'lpstat -t' and /var/log/cups/error_log."
 fi
 rm -f "$TMP"
+
+# ---------- 9. Optional Bluetooth setup ----------
+if [[ -n "$BT_MAC" ]]; then
+  log "Configuring Bluetooth printer at $BT_MAC (SPP channel $BT_CHANNEL)..."
+
+  # 9a. Persistent rfcomm bind via systemd
+  $SUDO tee /etc/systemd/system/rfcomm-printer.service >/dev/null <<EOF
+[Unit]
+Description=Bind Bluetooth thermal printer to /dev/rfcomm0
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/bin/rfcomm release 0
+ExecStart=/usr/bin/rfcomm bind 0 ${BT_MAC} ${BT_CHANNEL}
+ExecStartPost=/bin/sh -c "for i in 1 2 3 4 5; do [ -e /dev/rfcomm0 ] && break; sleep 0.2; done; chgrp lp /dev/rfcomm0; chmod 660 /dev/rfcomm0"
+ExecStop=/usr/bin/rfcomm release 0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable rfcomm-printer.service >/dev/null 2>&1
+  $SUDO systemctl restart rfcomm-printer.service
+  sleep 1
+
+  # 9b. udev rule so re-bound device gets correct group
+  $SUDO tee /etc/udev/rules.d/99-rfcomm-printer.rules >/dev/null <<EOF
+KERNEL=="rfcomm0", GROUP="lp", MODE="0660"
+EOF
+  $SUDO udevadm control --reload-rules
+
+  # 9c. Make CUPS run the serial backend as root (Ubuntu ships it 0744 which
+  #     forces unprivileged execution and EACCES on /dev/rfcomm0)
+  $SUDO chmod 0700 /usr/lib/cups/backend/serial
+
+  # 9d. Allow cupsd's AppArmor profile to access /dev/rfcomm*
+  if [[ -d /etc/apparmor.d/local ]] && [[ -f /etc/apparmor.d/usr.sbin.cupsd ]]; then
+    $SUDO tee /etc/apparmor.d/local/usr.sbin.cupsd >/dev/null <<EOF
+# Bluetooth thermal printers via SPP / rfcomm
+/dev/rfcomm[0-9]* rw,
+EOF
+    $SUDO apparmor_parser -r /etc/apparmor.d/usr.sbin.cupsd 2>/dev/null || \
+      warn "apparmor_parser failed; reload manually if BT print returns EACCES."
+    $SUDO systemctl restart cups
+  fi
+
+  # 9e. Add the BT CUPS queue using the same PPD/filter
+  BT_QUEUE="${QUEUE}-BT"
+  if lpstat -p "$BT_QUEUE" >/dev/null 2>&1; then
+    $SUDO lpadmin -x "$BT_QUEUE" || true
+  fi
+  $SUDO lpadmin -p "$BT_QUEUE" -E \
+    -v "serial:/dev/rfcomm0?baud=9600" \
+    -P "$PPD_PATH" \
+    -o printer-is-shared=false \
+    -o "media=Custom.${WIDTH_MM}x297mm" \
+    -o Resolution=203dpi
+  $SUDO cupsenable "$BT_QUEUE"
+  $SUDO cupsaccept "$BT_QUEUE"
+  ok "Bluetooth queue '$BT_QUEUE' installed."
+fi
 
 cat <<MSG
 
